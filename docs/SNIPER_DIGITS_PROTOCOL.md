@@ -6,13 +6,15 @@ The collector is passive and single-symbol. `discovery` records tick-time states
 
 The live transport uses only public tick history/tick subscriptions and proposal requests. There is no account credential or execution path. A proposal supplies the actual ask and payout; break-even is `ask_price / payout`, edge is `estimated_p - break_even`, and PAPER EV is `estimated_p * payout - ask_price`.
 
+The current transport is `wss://api.derivws.com/trading/v1/options/ws/public`. Every connection performs a fail-fast `active_symbols`/`contracts_for` preflight, derives canonical decimal precision from the symbol's pip increment, then requests history and a separate live tick subscription. Proposal requests use `underlying_symbol`; no private API is used.
+
 Settlement is by exact tick sequence: for a one-tick contract the next received clean tick is the settlement tick. A gap cancels unresolved shots and resets the clean lookback. Delayed tracks are labelled counterfactual; only delay zero on `SNIPER` is the primary prospective observation. Matched controls preserve contract, barrier, state economics, and temporal neighbourhood.
 
 ## Files
 
 Each run is under `data/digits_over_under/<symbol>/sniper_digits_v1/run_<run_id>/`:
 
-* `metadata.json`: versions, run/session identity, timestamps, complete CLI, Git/Python/websockets versions, lookbacks, hypotheses/frozen rules, families, stake/currency, seed and mode.
+* `metadata.json`: versions, run/session identity, timestamps, complete CLI, Git/Python/websockets versions, lookbacks, hypotheses/frozen rules, families, stake/currency, seed, mode, canonical `pip_digits` and public endpoint.
 * `ticks.parquet.jsonl` (incremental authority) and, when PyArrow is installed, `ticks.parquet`: `run_id,symbol,epoch,local_received_ts,quote,pip_size,last_digit,tick_seq,connection_id,gap_flag`.
 * `opportunities.parquet[.jsonl]`: `epoch,run_id,state,candidate,proposal,break_even,estimated_p,edge,decision,reason,mode`. State contains lag digits, digit frequencies at 10/20/50/100, streaks, group counts, entropy, chi-square, extrema, time-since each digit and stable `state_id`.
 * `proposals.parquet[.jsonl]`: `run_id,epoch,contract_type,barrier,duration,duration_unit,stake,ask_price,payout,break_even,proposal_id,proposal_epoch,proposal_latency_ms`.
@@ -31,6 +33,8 @@ No state may include the settlement tick, future proposal response, or retroacti
 Install optional runtime/test dependencies: `python -m pip install websockets pyarrow pytest`.
 
 Offline tests: `python -m pytest -q`.
+
+Manual LIVE read-only integration test: `RUN_DERIV_LIVE_TEST=1 python -m pytest -q -s tests/test_live_options_api.py`. It validates `active_symbols`, `1HZ10V`, history, a live tick, contracts and one proposal; it contains no execution request.
 
 Discovery smoke test (Ctrl+C after data arrives): `python sniper_digits_ou_research_v1.py --symbol 1HZ10V --minutes 1 --history 5000 --session-label smoke`.
 

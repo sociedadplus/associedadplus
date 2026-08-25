@@ -22,7 +22,7 @@ import sys
 import time
 import uuid
 from collections import Counter, deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -30,6 +30,7 @@ from typing import Any, Iterable
 
 ENGINE_VERSION = "1.0.0"
 PROTOCOL_VERSION = "digits-ou-paper-v1"
+PUBLIC_OPTIONS_WS = "wss://api.derivws.com/trading/v1/options/ws/public"
 CONTRACTS = [("DIGITOVER", b) for b in range(4)] + [("DIGITUNDER", b) for b in range(6, 10)]
 LOOKBACKS = (10, 20, 50, 100)
 RESULT_FIELDS = ["shot_id", "run_id", "symbol", "signal_epoch", "signal_tick_seq", "contract_type",
@@ -51,6 +52,68 @@ def last_digit(quote: int | float | str | Decimal, pip_size: int) -> int:
     return int(scaled) % 10
 
 
+def pip_digits(value: int | float | str | Decimal) -> int:
+    """Normalise either decimal pip size (0.001) or a digit count (3)."""
+    pip = Decimal(str(value))
+    if pip < 0:
+        raise ValueError("pip_size must be non-negative")
+    if pip == pip.to_integral_value():
+        return int(pip)
+    normalized = pip.normalize()
+    if normalized.as_tuple().digits != (1,) or normalized.as_tuple().exponent >= 0:
+        raise ValueError(f"pip_size is not a power of ten: {value}")
+    return -normalized.as_tuple().exponent
+
+
+class APIResponseError(RuntimeError):
+    def __init__(self, code: str, message: str):
+        self.code, self.message = code, message
+        super().__init__(f"{code}: {message}" if code else message)
+
+
+def response_errors(message: dict[str, Any]) -> list[dict[str, str]]:
+    """Return a uniform list for both legacy ``error`` and current ``errors``."""
+    raw = message.get("errors", message.get("error", []))
+    if not raw:
+        return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raw = [{"message": str(raw)}]
+    return [{"code": str(item.get("code", "")), "message": str(item.get("message", item))}
+            if isinstance(item, dict) else {"code": "", "message": str(item)} for item in raw]
+
+
+def raise_for_api_errors(message: dict[str, Any]) -> None:
+    errors = response_errors(message)
+    if errors:
+        combined = "; ".join(f'{e["code"]}: {e["message"]}'.strip(": ") for e in errors)
+        raise APIResponseError(",".join(e["code"] for e in errors if e["code"]), combined)
+
+
+def active_symbols_payload(req_id: int) -> dict[str, Any]:
+    return {"active_symbols": "brief", "product_type": "basic", "req_id": req_id}
+
+
+def contracts_for_payload(symbol: str, req_id: int) -> dict[str, Any]:
+    # contracts_for retains its documented selector; only proposal renamed this field.
+    return {"contracts_for": symbol, "product_type": "basic", "req_id": req_id}
+
+
+def history_payload(symbol: str, count: int, req_id: int) -> dict[str, Any]:
+    return {"ticks_history": symbol, "count": count, "end": "latest", "style": "ticks", "req_id": req_id}
+
+
+def ticks_payload(symbol: str, req_id: int) -> dict[str, Any]:
+    return {"ticks": symbol, "subscribe": 1, "req_id": req_id}
+
+
+def proposal_payload(args: argparse.Namespace, hypothesis: "Hypothesis", req_id: int) -> dict[str, Any]:
+    return {"proposal": 1, "amount": args.stake, "basis": "stake", "contract_type": hypothesis.contract_type,
+            "currency": args.currency, "duration": 1, "duration_unit": "t", "barrier": str(hypothesis.barrier),
+            "underlying_symbol": args.symbol, "req_id": req_id}
+
+
 def contract_wins(contract_type: str, barrier: int, digit: int) -> bool:
     if contract_type == "DIGITOVER":
         return digit > barrier
@@ -60,9 +123,12 @@ def contract_wins(contract_type: str, barrier: int, digit: int) -> bool:
 
 
 def proposal_economics(proposal: dict[str, Any]) -> tuple[float, float, float]:
-    ask, payout = float(proposal["ask_price"]), float(proposal["payout"])
-    if ask <= 0 or payout <= 0:
-        raise ValueError("proposal ask_price and payout must be positive")
+    try:
+        ask, payout = float(Decimal(str(proposal["ask_price"]))), float(Decimal(str(proposal["payout"])))
+    except (KeyError, ValueError, ArithmeticError) as exc:
+        raise ValueError("proposal lacks valid ask_price/payout economics") from exc
+    if not math.isfinite(ask) or not math.isfinite(payout) or ask <= 0 or payout <= ask:
+        raise ValueError("proposal requires finite positive payout greater than ask_price")
     return ask, payout, ask / payout
 
 
@@ -165,6 +231,7 @@ class ResearchEngine:
         self.digits: deque[int] = deque(maxlen=max(args.history, 100))
         self.seq = 0; self.connection_id = ""; self.clean_ticks = 0; self.pending: list[dict[str, Any]] = []
         self.stop = False; self.rng = random.Random(args.seed)
+        self.pip_digits = pip_digits(args.pip_size)
         self.hypotheses = self._hypotheses()
         self._write_metadata(None)
 
@@ -195,24 +262,30 @@ class ResearchEngine:
                     websockets_version=websocket_version, lookbacks=LOOKBACKS,
                     hypotheses=[asdict(h) for h in getattr(self, "hypotheses", [])],
                     frozen_rules=self.args.mode == "oos", contract_families=CONTRACTS, stake=self.args.stake,
-                    currency=self.args.currency, random_seed=self.args.seed, mode=self.args.mode)
+                    currency=self.args.currency, random_seed=self.args.seed, mode=self.args.mode,
+                    pip_digits=getattr(self, "pip_digits", None), public_endpoint=PUBLIC_OPTIONS_WS)
         (self.root / "metadata.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def mark_gap(self, reason: str) -> None:
         self.clean_ticks = 0; self.pending.clear(); self.event(f"GAP DETECTED: {reason}")
 
-    def ingest_tick(self, tick: dict[str, Any], gap=False) -> list[tuple[Hypothesis, dict[str, Any]]]:
+    def ingest_tick(self, tick: dict[str, Any], gap=False, eligible=True) -> list[tuple[Hypothesis, dict[str, Any]]]:
         self.seq += 1
-        pip = int(tick.get("pip_size", self.args.pip_size))
+        received_pip = tick.get("pip_size")
+        if received_pip is not None and pip_digits(received_pip) != self.pip_digits:
+            raise APIResponseError("PIP_SIZE_MISMATCH",
+                                   f"tick pip_size={received_pip} differs from preflight digits={self.pip_digits}")
+        pip = self.pip_digits
         digit = last_digit(tick["quote"], pip)
         if gap: self.mark_gap("tick sequence/connection discontinuity")
         self.ticks.append(dict(run_id=self.run_id, symbol=self.args.symbol, epoch=int(tick["epoch"]),
                                local_received_ts=utcnow(), quote=str(tick["quote"]), pip_size=pip,
                                last_digit=digit, tick_seq=self.seq, connection_id=self.connection_id, gap_flag=gap))
         self.digits.append(digit); self.clean_ticks += 1
-        self._settle(int(tick["epoch"]), digit)
+        if eligible:
+            self._settle(int(tick["epoch"]), digit)
         if self.clean_ticks == 100: self.event("LOOKBACK REBUILD")
-        if self.clean_ticks >= 100: return self._evaluate(int(tick["epoch"]), digit)
+        if eligible and self.clean_ticks >= 100: return self._evaluate(int(tick["epoch"]), digit)
         return []
 
     def _evaluate(self, epoch: int, digit: int) -> list[tuple[Hypothesis, dict[str, Any]]]:
@@ -311,42 +384,110 @@ def max_streak(rows: Iterable[dict[str, Any]], key: str) -> int:
     return best
 
 
+def find_active_symbol(message: dict[str, Any], symbol: str) -> dict[str, Any] | None:
+    entries = message.get("active_symbols", [])
+    return next((item for item in entries
+                 if item.get("symbol", item.get("underlying_symbol")) == symbol), None)
+
+
+def available_contract_types(message: dict[str, Any]) -> set[str]:
+    body = message.get("contracts_for", {})
+    entries = body.get("available", body if isinstance(body, list) else [])
+    return {str(item.get("contract_type", item.get("contract", ""))) for item in entries}
+
+
+async def receive_request(ws, payload: dict[str, Any]) -> dict[str, Any]:
+    """Send a preflight request and wait for its correlated response."""
+    await ws.send(json.dumps(payload))
+    while True:
+        message = json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+        if message.get("req_id") == payload["req_id"]:
+            raise_for_api_errors(message)
+            return message
+
+
+async def live_preflight(ws, engine: ResearchEngine) -> None:
+    active = await receive_request(ws, active_symbols_payload(1))
+    selected = find_active_symbol(active, engine.args.symbol)
+    if selected is None:
+        raise APIResponseError("INVALID_SYMBOL", f"{engine.args.symbol} is not present in active_symbols")
+    if selected.get("is_trading_suspended") in (1, True):
+        raise APIResponseError("INACTIVE_SYMBOL", f"{engine.args.symbol} is trading-suspended")
+    if "pip_size" not in selected:
+        raise APIResponseError("MISSING_PIP_SIZE", f"active_symbols omitted pip_size for {engine.args.symbol}")
+    engine.pip_digits = pip_digits(selected["pip_size"])
+    contracts = await receive_request(ws, contracts_for_payload(engine.args.symbol, 2))
+    available = available_contract_types(contracts)
+    missing = {"DIGITOVER", "DIGITUNDER"} - available
+    if missing:
+        raise APIResponseError("MISSING_CONTRACTS", f"{engine.args.symbol} does not offer {sorted(missing)}")
+    engine._write_metadata(None)
+    engine.event(f"PREFLIGHT OK symbol={engine.args.symbol} pip_digits={engine.pip_digits} contracts=DIGITOVER,DIGITUNDER")
+
+
 async def run_live(engine: ResearchEngine) -> None:
     import websockets
     deadline=time.monotonic()+engine.args.minutes*60
     while not engine.stop and time.monotonic() < deadline:
         try:
             engine.connection_id=uuid.uuid4().hex[:8]; engine.event(f"RECONNECT connection_id={engine.connection_id}")
-            async with websockets.connect(f"wss://ws.derivws.com/websockets/v3?app_id={engine.args.app_id}") as ws:
+            async with websockets.connect(PUBLIC_OPTIONS_WS) as ws:
+                await live_preflight(ws, engine)
                 proposal_requests: dict[int, tuple[Hypothesis, dict[str, Any], int, float]] = {}
-                request_id=0
+                request_id=100
                 async def request_proposals(requests, epoch):
                     nonlocal request_id
                     for h,state in requests:
                         request_id += 1
                         proposal_requests[request_id]=(h,state,epoch,time.monotonic())
-                        await ws.send(json.dumps({"proposal":1,"amount":engine.args.stake,"basis":"stake",
-                            "contract_type":h.contract_type,"currency":engine.args.currency,"duration":1,
-                            "duration_unit":"t","barrier":str(h.barrier),"symbol":engine.args.symbol,"req_id":request_id}))
-                await ws.send(json.dumps({"ticks_history": engine.args.symbol, "count": engine.args.history,
-                                          "end": "latest", "style": "ticks", "subscribe": 1}))
+                        await ws.send(json.dumps(proposal_payload(engine.args, h, request_id)))
+                request_id += 1
+                history_id = request_id
+                await ws.send(json.dumps(history_payload(engine.args.symbol, engine.args.history, history_id)))
+                subscribed = False
                 async for raw in ws:
                     msg=json.loads(raw)
-                    if "error" in msg: raise RuntimeError(msg["error"]["message"])
+                    errors=response_errors(msg)
+                    if errors:
+                        detail="; ".join(f'{e["code"]}: {e["message"]}'.strip(": ") for e in errors)
+                        engine.event(f"API ERROR req_id={msg.get('req_id')} {detail}")
+                        if msg.get("req_id") in proposal_requests:
+                            h,state,epoch,_=proposal_requests.pop(msg["req_id"])
+                            engine.opportunities.append(dict(epoch=epoch,run_id=engine.run_id,state=state,
+                                candidate=asdict(h),proposal=None,break_even=None,estimated_p=h.estimate(list(engine.digits)),
+                                edge=None,decision="NO_PROPOSAL",reason=detail,mode="oos"))
+                            continue
+                        raise_for_api_errors(msg)
                     if "history" in msg:
-                        pips=int(msg.get("pip_size", engine.args.pip_size))
+                        if msg.get("pip_size") is not None and pip_digits(msg["pip_size"]) != engine.pip_digits:
+                            raise APIResponseError("PIP_SIZE_MISMATCH",
+                                f"history pip_size={msg['pip_size']} differs from preflight digits={engine.pip_digits}")
                         for epoch, quote in zip(msg["history"]["times"], msg["history"]["prices"]):
                             # Seed history is persisted and builds state, but does not solicit retroactive proposals.
-                            engine.ingest_tick({"epoch":epoch,"quote":quote,"pip_size":pips})
+                            engine.ingest_tick({"epoch":epoch,"quote":quote}, eligible=False)
+                        if not subscribed:
+                            request_id += 1
+                            await ws.send(json.dumps(ticks_payload(engine.args.symbol, request_id)))
+                            subscribed = True
                     elif "tick" in msg:
                         tick=msg["tick"]; await request_proposals(engine.ingest_tick(tick),int(tick["epoch"]))
                     elif "proposal" in msg and msg.get("req_id") in proposal_requests:
                         h,state,epoch,sent=proposal_requests.pop(msg["req_id"])
                         proposal=dict(msg["proposal"]); proposal["latency_ms"]=(time.monotonic()-sent)*1000
-                        engine.accept_proposal(h,state,proposal,epoch)
+                        try:
+                            engine.accept_proposal(h,state,proposal,epoch)
+                        except ValueError as exc:
+                            engine.event(f"API ERROR req_id={msg.get('req_id')} INVALID_PROPOSAL_ECONOMICS: {exc}")
+                            engine.opportunities.append(dict(epoch=epoch,run_id=engine.run_id,state=state,
+                                candidate=asdict(h),proposal=proposal,break_even=None,
+                                estimated_p=h.estimate(list(engine.digits)),edge=None,decision="NO_PROPOSAL",
+                                reason=f"INVALID_PROPOSAL_ECONOMICS: {exc}",mode="oos"))
                     if engine.stop or time.monotonic() >= deadline: break
+        except APIResponseError as exc:
+            engine.event(f"API ERROR code={exc.code} message={exc.message}")
+            raise  # API/schema errors are never mislabeled as market-data gaps.
         except Exception as exc:
-            engine.mark_gap(str(exc)); await asyncio.sleep(2)
+            engine.mark_gap(f"transport failure: {type(exc).__name__}: {exc}"); await asyncio.sleep(2)
 
 
 def parse_args(argv=None):
