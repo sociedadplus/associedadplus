@@ -2,8 +2,8 @@ import argparse, asyncio, csv, json
 from pathlib import Path
 import pytest
 from sniper_digits_ou_research_v1 import (APIResponseError, Hypothesis, PUBLIC_OPTIONS_WS, ResearchEngine,
-    contract_wins, last_digit, live_preflight, pip_digits, proposal_economics, proposal_payload,
-    response_errors, state_snapshot)
+    active_symbols_payload, contract_wins, contracts_for_payload, history_payload, last_digit, live_preflight,
+    pip_digits, proposal_economics, proposal_payload, response_errors, state_snapshot, ticks_payload)
 from analyze_sniper_digits_ou_v1 import report
 
 def args(tmp_path, mode="discovery", hypotheses=None):
@@ -66,6 +66,21 @@ def test_current_proposal_payload_and_endpoint(tmp_path):
     h=Hypothesis("h","DIGITOVER",1); payload=proposal_payload(args(tmp_path),h,9)
     assert payload["underlying_symbol"]=="1HZ10V" and "symbol" not in payload
     assert PUBLIC_OPTIONS_WS=="wss://api.derivws.com/trading/v1/options/ws/public"
+
+def test_current_public_payload_schemas_exclude_legacy_fields(tmp_path):
+    active_payload=active_symbols_payload(1)
+    contracts_payload=contracts_for_payload("1HZ10V",2)
+    history=history_payload("1HZ10V",5000,3)
+    ticks=ticks_payload("1HZ10V",4)
+    proposal=proposal_payload(args(tmp_path),Hypothesis("h","DIGITUNDER",8),5)
+    assert active_payload=={"active_symbols":"brief","req_id":1}
+    assert contracts_payload=={"contracts_for":"1HZ10V","req_id":2}
+    assert "product_type" not in active_payload
+    assert "product_type" not in contracts_payload
+    assert history=={"ticks_history":"1HZ10V","count":5000,"end":"latest","style":"ticks","req_id":3}
+    assert ticks=={"ticks":"1HZ10V","subscribe":1,"req_id":4}
+    assert proposal["underlying_symbol"]=="1HZ10V" and "symbol" not in proposal
+    assert all("product_type" not in payload for payload in (history,ticks,proposal))
 
 class FakeWS:
     def __init__(self,responses): self.responses=iter(responses); self.sent=[]

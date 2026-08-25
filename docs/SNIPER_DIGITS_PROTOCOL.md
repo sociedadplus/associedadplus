@@ -6,7 +6,7 @@ The collector is passive and single-symbol. `discovery` records tick-time states
 
 The live transport uses only public tick history/tick subscriptions and proposal requests. There is no account credential or execution path. A proposal supplies the actual ask and payout; break-even is `ask_price / payout`, edge is `estimated_p - break_even`, and PAPER EV is `estimated_p * payout - ask_price`.
 
-The current transport is `wss://api.derivws.com/trading/v1/options/ws/public`. Every connection performs a fail-fast `active_symbols`/`contracts_for` preflight, derives canonical decimal precision from the symbol's pip increment, then requests history and a separate live tick subscription. Proposal requests use `underlying_symbol`; no private API is used.
+The current transport is `wss://api.derivws.com/trading/v1/options/ws/public`. Every connection performs a fail-fast `active_symbols`/`contracts_for` preflight, derives canonical decimal precision from the symbol's pip increment, then requests history and a separate live tick subscription. Public Options API payloads deliberately omit the unsupported legacy `product_type` property. Proposal requests use `underlying_symbol`; no private API is used.
 
 Settlement is by exact tick sequence: for a one-tick contract the next received clean tick is the settlement tick. A gap cancels unresolved shots and resets the clean lookback. Delayed tracks are labelled counterfactual; only delay zero on `SNIPER` is the primary prospective observation. Matched controls preserve contract, barrier, state economics, and temporal neighbourhood.
 

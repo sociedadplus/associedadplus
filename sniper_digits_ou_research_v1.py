@@ -92,12 +92,11 @@ def raise_for_api_errors(message: dict[str, Any]) -> None:
 
 
 def active_symbols_payload(req_id: int) -> dict[str, Any]:
-    return {"active_symbols": "brief", "product_type": "basic", "req_id": req_id}
+    return {"active_symbols": "brief", "req_id": req_id}
 
 
 def contracts_for_payload(symbol: str, req_id: int) -> dict[str, Any]:
-    # contracts_for retains its documented selector; only proposal renamed this field.
-    return {"contracts_for": symbol, "product_type": "basic", "req_id": req_id}
+    return {"contracts_for": symbol, "req_id": req_id}
 
 
 def history_payload(symbol: str, count: int, req_id: int) -> dict[str, Any]:
