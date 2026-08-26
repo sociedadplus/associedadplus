@@ -31,6 +31,7 @@ from typing import Any, Iterable
 ENGINE_VERSION = "1.0.0"
 PROTOCOL_VERSION = "digits-ou-paper-v1"
 PUBLIC_OPTIONS_WS = "wss://api.derivws.com/trading/v1/options/ws/public"
+PROPOSAL_CACHE_TTL_SECONDS = 10.0
 CONTRACTS = [("DIGITOVER", b) for b in range(4)] + [("DIGITUNDER", b) for b in range(6, 10)]
 LOOKBACKS = (10, 20, 50, 100)
 RESULT_FIELDS = ["shot_id", "run_id", "symbol", "signal_epoch", "signal_tick_seq", "contract_type",
@@ -230,6 +231,8 @@ class ResearchEngine:
         self.digits: deque[int] = deque(maxlen=max(args.history, 100))
         self.seq = 0; self.connection_id = ""; self.clean_ticks = 0; self.pending: list[dict[str, Any]] = []
         self.stop = False; self.rng = random.Random(args.seed)
+        self.proposal_stats = dict(proposal_requests_sent=0, proposal_cache_hits=0,
+                                   proposal_cache_misses=0, proposal_rate_limits=0)
         self.pip_digits = pip_digits(args.pip_size)
         self.hypotheses = self._hypotheses()
         self._write_metadata(None)
@@ -262,7 +265,9 @@ class ResearchEngine:
                     hypotheses=[asdict(h) for h in getattr(self, "hypotheses", [])],
                     frozen_rules=self.args.mode == "oos", contract_families=CONTRACTS, stake=self.args.stake,
                     currency=self.args.currency, random_seed=self.args.seed, mode=self.args.mode,
-                    pip_digits=getattr(self, "pip_digits", None), public_endpoint=PUBLIC_OPTIONS_WS)
+                    pip_digits=getattr(self, "pip_digits", None), public_endpoint=PUBLIC_OPTIONS_WS,
+                    proposal_cache_ttl_seconds=PROPOSAL_CACHE_TTL_SECONDS,
+                    proposal_stats=getattr(self, "proposal_stats", {}))
         (self.root / "metadata.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def mark_gap(self, reason: str) -> None:
@@ -367,7 +372,8 @@ class ResearchEngine:
 
     def close(self) -> None:
         for table in (self.ticks, self.opportunities, self.proposals): table.close()
-        self.summarize(); self.events.close(); self._write_metadata(utcnow())
+        self.summarize(); self.event("PROPOSAL STATISTICS " + " ".join(f"{k}={v}" for k,v in self.proposal_stats.items()))
+        self.events.close(); self._write_metadata(utcnow())
 
 
 def wilson(wins: int, n: int, z: float = 1.96) -> tuple[float, float]:
@@ -424,22 +430,108 @@ async def live_preflight(ws, engine: ResearchEngine) -> None:
     engine.event(f"PREFLIGHT OK symbol={engine.args.symbol} pip_digits={engine.pip_digits} contracts=DIGITOVER,DIGITUNDER")
 
 
+class ProposalCoordinator:
+    """Deduplicate, cache and back off public proposal requests."""
+    def __init__(self, engine: ResearchEngine, ttl: float = PROPOSAL_CACHE_TTL_SECONDS,
+                 clock=time.monotonic):
+        self.engine, self.ttl, self.clock = engine, ttl, clock
+        self.cache: dict[tuple[Any, ...], tuple[dict[str, Any], float]] = {}
+        self.inflight: dict[tuple[Any, ...], int] = {}
+        self.requests: dict[int, dict[str, Any]] = {}
+        self.backoff_until: dict[tuple[Any, ...], float] = {}
+        self.rate_limit_attempts: Counter = Counter()
+
+    def key(self, hypothesis: Hypothesis) -> tuple[Any, ...]:
+        return (self.engine.args.symbol, hypothesis.contract_type, hypothesis.barrier,
+                float(self.engine.args.stake), self.engine.args.currency)
+
+    def _no_proposal(self, hypothesis: Hypothesis, state: dict[str, Any], epoch: int, reason: str) -> None:
+        self.engine.opportunities.append(dict(epoch=epoch, run_id=self.engine.run_id, state=state,
+            candidate=asdict(hypothesis), proposal=None, break_even=None,
+            estimated_p=hypothesis.estimate(list(self.engine.digits)), edge=None,
+            decision="NO_PROPOSAL", reason=reason, mode="oos"))
+
+    def _apply(self, proposal: dict[str, Any], waiters: list[tuple[Hypothesis, dict[str, Any], int]]) -> None:
+        for hypothesis, state, epoch in waiters:
+            try:
+                self.engine.accept_proposal(hypothesis, state, dict(proposal), epoch)
+            except ValueError as exc:
+                reason=f"INVALID_PROPOSAL_ECONOMICS: {exc}"
+                self.engine.event(f"API ERROR {reason}")
+                self._no_proposal(hypothesis, state, epoch, reason)
+
+    async def dispatch(self, matches: list[tuple[Hypothesis, dict[str, Any]]], epoch: int,
+                       send, next_request_id) -> None:
+        groups: dict[tuple[Any, ...], list[tuple[Hypothesis, dict[str, Any], int]]] = {}
+        for hypothesis, state in matches:
+            groups.setdefault(self.key(hypothesis), []).append((hypothesis, state, epoch))
+        now=self.clock()
+        for key, waiters in groups.items():
+            cached=self.cache.get(key)
+            if cached and now-cached[1] < self.ttl:
+                self.engine.proposal_stats["proposal_cache_hits"] += 1
+                self.engine.event(f"PROPOSAL_CACHE_HIT key={key}")
+                self._apply(cached[0], waiters)
+                continue
+            self.engine.proposal_stats["proposal_cache_misses"] += 1
+            self.engine.event(f"PROPOSAL_CACHE_MISS key={key}")
+            if now < self.backoff_until.get(key, 0):
+                for waiter in waiters:self._no_proposal(*waiter, "PROPOSAL_RATE_LIMIT_BACKOFF")
+                continue
+            if key in self.inflight:
+                self.requests[self.inflight[key]]["waiters"].extend(waiters)
+                continue
+            request_id=next_request_id();hypothesis=waiters[0][0]
+            self.inflight[key]=request_id
+            self.requests[request_id]={"key":key,"waiters":waiters,"sent":now}
+            self.engine.proposal_stats["proposal_requests_sent"] += 1
+            self.engine.event(f"PROPOSAL_REFRESH key={key} req_id={request_id}")
+            await send(proposal_payload(self.engine.args, hypothesis, request_id))
+
+    def receive(self, request_id: int, proposal: dict[str, Any]) -> bool:
+        request=self.requests.pop(request_id, None)
+        if request is None:return False
+        key=request["key"];self.inflight.pop(key, None)
+        normalized=dict(proposal);normalized["latency_ms"]=(self.clock()-request["sent"])*1000
+        self.cache[key]=(normalized,self.clock());self.rate_limit_attempts[key]=0
+        self._apply(normalized,request["waiters"]);return True
+
+    def fail(self, request_id: int, errors: list[dict[str, str]]) -> bool:
+        request=self.requests.pop(request_id, None)
+        if request is None:return False
+        key=request["key"];self.inflight.pop(key, None)
+        detail="; ".join(f'{e["code"]}: {e["message"]}'.strip(": ") for e in errors)
+        is_rate_limit=any("ratelimit" in (e["code"]+e["message"]).replace(" ","").lower() for e in errors)
+        if is_rate_limit:
+            self.engine.proposal_stats["proposal_rate_limits"] += 1
+            self.rate_limit_attempts[key] += 1
+            delay=min(120.0,10.0*(2**(self.rate_limit_attempts[key]-1)))
+            self.backoff_until[key]=self.clock()+delay
+            self.engine.event(f"PROPOSAL_RATE_LIMIT key={key} backoff_seconds={delay} detail={detail}")
+        for waiter in request["waiters"]:self._no_proposal(*waiter,detail)
+        return True
+
+    def transport_reset(self) -> None:
+        """Drop orphaned requests while retaining TTL cache and rate-limit backoff."""
+        for request in self.requests.values():
+            for waiter in request["waiters"]:self._no_proposal(*waiter,"PROPOSAL_TRANSPORT_INTERRUPTED")
+        self.requests.clear();self.inflight.clear()
+
+
 async def run_live(engine: ResearchEngine) -> None:
     import websockets
     deadline=time.monotonic()+engine.args.minutes*60
+    coordinator=ProposalCoordinator(engine)
     while not engine.stop and time.monotonic() < deadline:
         try:
             engine.connection_id=uuid.uuid4().hex[:8]; engine.event(f"RECONNECT connection_id={engine.connection_id}")
             async with websockets.connect(PUBLIC_OPTIONS_WS) as ws:
                 await live_preflight(ws, engine)
-                proposal_requests: dict[int, tuple[Hypothesis, dict[str, Any], int, float]] = {}
                 request_id=100
-                async def request_proposals(requests, epoch):
+                def next_request_id():
                     nonlocal request_id
-                    for h,state in requests:
-                        request_id += 1
-                        proposal_requests[request_id]=(h,state,epoch,time.monotonic())
-                        await ws.send(json.dumps(proposal_payload(engine.args, h, request_id)))
+                    request_id+=1;return request_id
+                async def send_payload(payload):await ws.send(json.dumps(payload))
                 request_id += 1
                 history_id = request_id
                 await ws.send(json.dumps(history_payload(engine.args.symbol, engine.args.history, history_id)))
@@ -450,11 +542,7 @@ async def run_live(engine: ResearchEngine) -> None:
                     if errors:
                         detail="; ".join(f'{e["code"]}: {e["message"]}'.strip(": ") for e in errors)
                         engine.event(f"API ERROR req_id={msg.get('req_id')} {detail}")
-                        if msg.get("req_id") in proposal_requests:
-                            h,state,epoch,_=proposal_requests.pop(msg["req_id"])
-                            engine.opportunities.append(dict(epoch=epoch,run_id=engine.run_id,state=state,
-                                candidate=asdict(h),proposal=None,break_even=None,estimated_p=h.estimate(list(engine.digits)),
-                                edge=None,decision="NO_PROPOSAL",reason=detail,mode="oos"))
+                        if coordinator.fail(msg.get("req_id"), errors):
                             continue
                         raise_for_api_errors(msg)
                     if "history" in msg:
@@ -469,23 +557,16 @@ async def run_live(engine: ResearchEngine) -> None:
                             await ws.send(json.dumps(ticks_payload(engine.args.symbol, request_id)))
                             subscribed = True
                     elif "tick" in msg:
-                        tick=msg["tick"]; await request_proposals(engine.ingest_tick(tick),int(tick["epoch"]))
-                    elif "proposal" in msg and msg.get("req_id") in proposal_requests:
-                        h,state,epoch,sent=proposal_requests.pop(msg["req_id"])
-                        proposal=dict(msg["proposal"]); proposal["latency_ms"]=(time.monotonic()-sent)*1000
-                        try:
-                            engine.accept_proposal(h,state,proposal,epoch)
-                        except ValueError as exc:
-                            engine.event(f"API ERROR req_id={msg.get('req_id')} INVALID_PROPOSAL_ECONOMICS: {exc}")
-                            engine.opportunities.append(dict(epoch=epoch,run_id=engine.run_id,state=state,
-                                candidate=asdict(h),proposal=proposal,break_even=None,
-                                estimated_p=h.estimate(list(engine.digits)),edge=None,decision="NO_PROPOSAL",
-                                reason=f"INVALID_PROPOSAL_ECONOMICS: {exc}",mode="oos"))
+                        tick=msg["tick"]
+                        await coordinator.dispatch(engine.ingest_tick(tick),int(tick["epoch"]),send_payload,next_request_id)
+                    elif "proposal" in msg:
+                        coordinator.receive(msg.get("req_id"),msg["proposal"])
                     if engine.stop or time.monotonic() >= deadline: break
         except APIResponseError as exc:
             engine.event(f"API ERROR code={exc.code} message={exc.message}")
             raise  # API/schema errors are never mislabeled as market-data gaps.
         except Exception as exc:
+            coordinator.transport_reset()
             engine.mark_gap(f"transport failure: {type(exc).__name__}: {exc}"); await asyncio.sleep(2)
 
 

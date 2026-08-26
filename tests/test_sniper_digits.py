@@ -1,7 +1,7 @@
 import argparse, asyncio, csv, json
 from pathlib import Path
 import pytest
-from sniper_digits_ou_research_v1 import (APIResponseError, Hypothesis, PUBLIC_OPTIONS_WS, ResearchEngine,
+from sniper_digits_ou_research_v1 import (APIResponseError, Hypothesis, ProposalCoordinator, PUBLIC_OPTIONS_WS, ResearchEngine,
     active_symbols_payload, contract_wins, contracts_for_payload, history_payload, last_digit, live_preflight,
     pip_digits, proposal_economics, proposal_payload, response_errors, state_snapshot, ticks_payload)
 from analyze_sniper_digits_ou_v1 import report
@@ -101,3 +101,41 @@ def test_preflight_rejects_unknown_symbol_without_reconnect(tmp_path):
     e=ResearchEngine(args(tmp_path)); ws=FakeWS([active("R_10")])
     with pytest.raises(APIResponseError,match="active_symbols"): asyncio.run(live_preflight(ws,e))
     e.close()
+
+class DummyProposalEngine:
+    def __init__(self):
+        self.args=argparse.Namespace(symbol="1HZ10V",stake=1,currency="USD")
+        self.proposal_stats={"proposal_requests_sent":0,"proposal_cache_hits":0,"proposal_cache_misses":0,"proposal_rate_limits":0}
+        self.events=[];self.accepted=[];self.opportunities=[];self.run_id="r";self.digits=[9]*100
+    def event(self,message):self.events.append(message)
+    def accept_proposal(self,hypothesis,state,proposal,epoch):self.accepted.append((hypothesis.hypothesis_id,epoch,proposal["id"]))
+
+def test_fifty_same_contract_hypotheses_send_one_proposal_within_ttl():
+    engine=DummyProposalEngine();now=[100.0];coordinator=ProposalCoordinator(engine,ttl=10,clock=lambda:now[0])
+    hypotheses=[Hypothesis(f"h{i}","DIGITOVER",2) for i in range(50)]
+    matches=[(h,{"entropy":3.0}) for h in hypotheses];sent=[];request_ids=iter(range(1000,1100))
+    async def send(payload):sent.append(payload)
+    next_id=lambda:next(request_ids)
+    asyncio.run(coordinator.dispatch(matches,1,send,next_id))
+    asyncio.run(coordinator.dispatch(matches,2,send,next_id))
+    assert len(sent)==1 and engine.proposal_stats["proposal_requests_sent"]==1
+    coordinator.receive(sent[0]["req_id"],{"id":"p","ask_price":"1","payout":"1.2"})
+    asyncio.run(coordinator.dispatch(matches,3,send,next_id))
+    assert len(sent)==1 and engine.proposal_stats["proposal_cache_hits"]==1
+    assert len(engine.accepted)==150
+    assert any("PROPOSAL_CACHE_MISS" in event for event in engine.events)
+    assert any("PROPOSAL_REFRESH" in event for event in engine.events)
+    assert any("PROPOSAL_CACHE_HIT" in event for event in engine.events)
+
+def test_proposal_cache_expiry_refresh_and_rate_limit_backoff():
+    engine=DummyProposalEngine();now=[0.0];coordinator=ProposalCoordinator(engine,ttl=10,clock=lambda:now[0])
+    match=[(Hypothesis("h","DIGITUNDER",8),{"entropy":3.0})];sent=[];ids=iter((1,2,3))
+    async def send(payload):sent.append(payload)
+    asyncio.run(coordinator.dispatch(match,1,send,lambda:next(ids)))
+    coordinator.receive(1,{"id":"p1","ask_price":1,"payout":1.2});now[0]=11
+    asyncio.run(coordinator.dispatch(match,2,send,lambda:next(ids)))
+    assert len(sent)==2
+    coordinator.fail(2,[{"code":"RateLimit","message":"You have reached the rate limit for proposal."}])
+    asyncio.run(coordinator.dispatch(match,3,send,lambda:next(ids)))
+    assert len(sent)==2 and engine.proposal_stats["proposal_rate_limits"]==1
+    assert any("PROPOSAL_RATE_LIMIT" in event for event in engine.events)
