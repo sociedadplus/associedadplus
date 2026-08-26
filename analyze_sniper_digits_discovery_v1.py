@@ -14,7 +14,8 @@ REPORT_SECTIONS = ("DATA INTEGRITY","BASELINE RESULTS","TRAIN/CONFIRM","MULTIPLE
                    "CROSS-SYMBOL REPLICATION","TEMPORAL STABILITY","LOSS-STREAK ANALYSIS","SHORTLIST",
                    "OOS RECOMMENDATIONS","LIMITATIONS")
 CANDIDATE_FIELDS = ["candidate_id","symbol","contract_type","barrier","feature_1","operator_1","threshold_1",
- "feature_2","operator_2","threshold_2","symbols_replicated","replication_category","N_train","WR_train",
+ "feature_2","operator_2","threshold_2","strict_symbols_replicated","strict_replication_category",
+ "family_symbols_replicated","family_replication_category","N_train","WR_train",
  "edge_train","N_confirm","WR_confirm","edge_confirm","Wilson_confirm_low","conservative_edge_confirm",
  "p_raw","p_bonferroni","p_fdr","temporal_stability","max_loss_streak","max_win_streak","loss_streak_distribution",
  "score","classification","block_stats"]
@@ -80,6 +81,17 @@ def streaks(results:list[bool])->tuple[int,int,dict[int,int]]:
     if lc:dist[lc]+=1
     return max_l,max_w,dict(sorted(dist.items()))
 
+def segmented_streaks(rows:list[dict[str,Any]],kind:str,barrier_:int)->tuple[int,int,dict[int,int]]:
+    """Compute streaks independently inside each clean run/connection segment."""
+    grouped=defaultdict(list)
+    for row in rows:grouped[(row["run_id"],row.get("connection_id",""),row.get("segment_id",row["run_id"]))].append(row)
+    max_l=max_w=0;distribution=Counter()
+    for group in grouped.values():
+        ordered=sorted(group,key=lambda r:(r["epoch"],r["tick_seq"]))
+        ml,mw,dist=streaks([contract_win(kind,barrier_,r["settlement_digit"]) for r in ordered])
+        max_l=max(max_l,ml);max_w=max(max_w,mw);distribution.update(dist)
+    return max_l,max_w,dict(sorted(distribution.items()))
+
 def match_outcome(op:dict[str,Any], ticks_by_seq:dict[int,dict[str,Any]], duplicate_epochs:set, horizon:int=1):
     state=op.get("state")
     if not isinstance(state,dict) or "tick_seq" not in state:return None,"DROP_INVALID_STATE"
@@ -104,7 +116,7 @@ def match_outcome(op:dict[str,Any], ticks_by_seq:dict[int,dict[str,Any]], duplic
 class Loaded:
     outcomes:list[dict[str,Any]]; integrity:list[dict[str,Any]]; drops:Counter; drop_records:list[dict[str,Any]]; ticks:int; opportunities:int
 
-def load_runs(root:Path,symbols:list[str],horizons:list[int])->Loaded:
+def load_runs(root:Path,symbols:list[str],horizons:list[int],run_ids:list[str]|None=None,session_labels:list[str]|None=None)->Loaded:
     outcomes=[]; integrity=[]; drops=Counter(); drop_records=[]; total_ticks=total_ops=0
     for run in sorted(root.glob("*/sniper_digits_v1/run_*")):
         if symbols and run.parts[-3] not in symbols:continue
@@ -113,7 +125,9 @@ def load_runs(root:Path,symbols:list[str],horizons:list[int])->Loaded:
         except Exception: meta={};status="DROPPED";reason="INVALID_METADATA"
         ticks=read_table(run,"ticks") if status=="USED" else []; ops=read_table(run,"opportunities") if status=="USED" else []
         required=("run_id","symbol","mode","engine_version","protocol_version","pip_digits")
-        if status=="USED" and any(meta.get(k) is None for k in required):status="DROPPED";reason="INCOMPATIBLE_METADATA"
+        if status=="USED" and run_ids and meta.get("run_id") not in run_ids:status="DROPPED";reason="FILTERED_RUN_ID"
+        elif status=="USED" and session_labels and meta.get("session_label") not in session_labels:status="DROPPED";reason="FILTERED_SESSION_LABEL"
+        elif status=="USED" and any(meta.get(k) is None for k in required):status="DROPPED";reason="INCOMPATIBLE_METADATA"
         elif status=="USED" and meta.get("symbol")!=run.parts[-3]:status="DROPPED";reason="SYMBOL_PATH_MISMATCH"
         elif status=="USED" and meta.get("mode")!="discovery":status="DROPPED";reason="NOT_DISCOVERY"
         elif status=="USED" and not ticks:status="DROPPED";reason="NO_TICKS"
@@ -124,6 +138,14 @@ def load_runs(root:Path,symbols:list[str],horizons:list[int])->Loaded:
         total_ticks+=len(ticks);total_ops+=len(ops)
         seq_counts=Counter(int(t["tick_seq"]) for t in ticks)
         by_seq={int(t["tick_seq"]):t for t in ticks}
+        segment_by_seq={};segment=0;previous=None
+        for t in sorted(ticks,key=lambda x:int(x["tick_seq"])):
+            discontinuous=(previous is None or int(t["tick_seq"])!=int(previous["tick_seq"])+1 or
+                t.get("connection_id")!=previous.get("connection_id") or bool(t.get("gap_flag")) or
+                int(t["epoch"])<=int(previous["epoch"]))
+            if discontinuous:segment+=1
+            segment_by_seq[int(t["tick_seq"])]=f'{meta.get("run_id")}:{t.get("connection_id")}:{segment}'
+            previous=t
         epoch_counts=Counter((t.get("connection_id"),int(t["epoch"])) for t in ticks)
         duplicates={key for key,n in epoch_counts.items() if n>1}
         duplicate_seqs={seq for seq,n in seq_counts.items() if n>1}
@@ -139,7 +161,9 @@ def load_runs(root:Path,symbols:list[str],horizons:list[int])->Loaded:
                         "epoch":op.get("epoch"),"tick_seq":op.get("state",{}).get("tick_seq"),"horizon":horizon,"reason":drop});continue
                 state=op["state"]
                 outcomes.append(dict(run_id=meta["run_id"],symbol=meta["symbol"],epoch=int(op["epoch"]),
-                    tick_seq=int(state["tick_seq"]),horizon=horizon,settlement_digit=digit,state=state))
+                    tick_seq=int(state["tick_seq"]),horizon=horizon,settlement_digit=digit,state=state,
+                    connection_id=by_seq[int(state["tick_seq"])].get("connection_id"),
+                    segment_id=segment_by_seq[int(state["tick_seq"])]))
     return Loaded(outcomes,integrity,drops,drop_records,total_ticks,total_ops)
 
 def numeric_features(rows:list[dict[str,Any]])->list[str]:
@@ -150,7 +174,7 @@ def numeric_features(rows:list[dict[str,Any]])->list[str]:
     return sorted(found)
 
 def thresholds(feature:str,values:list[float])->list[tuple[str,float]]:
-    values=sorted(set(values)); result=set()
+    values=sorted(values); result=set()
     if not values:return []
     for q in (.05,.1,.2,.3,.7,.8,.9,.95):
         value=values[min(len(values)-1,int((len(values)-1)*q))];result.add((">=" if q>=.5 else "<=",value))
@@ -165,6 +189,9 @@ def applies(row:dict[str,Any],feature:str,operator:str,threshold:float)->bool:
     if not isinstance(value,(int,float)):return False
     return value>=threshold if operator==">=" else value<=threshold
 
+def rule_applies(row:dict[str,Any],conditions:list[tuple[str,str,float]])->bool:
+    return all(applies(row,*condition) for condition in conditions)
+
 def block_statistics(rows:list[dict[str,Any]],kind:str,barrier_:int)->tuple[list[dict[str,Any]],float]:
     blocks=[]; signs=[]; base=baseline(kind,barrier_)
     by_run=defaultdict(list)
@@ -177,7 +204,7 @@ def block_statistics(rows:list[dict[str,Any]],kind:str,barrier_:int)->tuple[list
         if part:signs.append(wr>base)
     return blocks,sum(signs)/len(signs) if signs else 0
 
-def evaluate_candidates(rows:list[dict[str,Any]],train_fraction=.6,min_train=100,min_confirm=75,max_rules=5000):
+def evaluate_candidates(rows:list[dict[str,Any]],train_fraction=.6,min_train=100,min_confirm=75,max_rules=5000,max_pairs=200):
     results=[]; tested=0
     by_symbol=defaultdict(list)
     for r in rows:
@@ -194,24 +221,56 @@ def evaluate_candidates(rows:list[dict[str,Any]],train_fraction=.6,min_train=100
                     tr=[r for r in train if applies(r,feature,operator,threshold)];co=[r for r in confirm if applies(r,feature,operator,threshold)]
                     wt=sum(contract_win(kind,b,r["settlement_digit"]) for r in tr);wc=sum(contract_win(kind,b,r["settlement_digit"]) for r in co)
                     wrt=wt/len(tr) if tr else 0;wrc=wc/len(co) if co else 0;lo,_=wilson(wc,len(co)); blocks,stability=block_statistics(co,kind,b)
-                    seq=[contract_win(kind,b,r["settlement_digit"]) for r in sorted(co,key=lambda r:(r["epoch"],r["tick_seq"]))];ml,mw,dist=streaks(seq)
+                    ml,mw,dist=segmented_streaks(co,kind,b)
                     valid=len(tr)>=min_train and len(co)>=min_confirm and wrt>base and wrc>base
                     classification="REJECT" if not valid else ("STRONG_DISCOVERY_CANDIDATE" if lo>=base and stability>=.75 else "PROMISING")
                     cid=hashlib.sha256(f"{symbol}|{kind}|{b}|{feature}|{operator}|{threshold}".encode()).hexdigest()[:16]
                     results.append(dict(candidate_id=cid,symbol=symbol,contract_type=kind,barrier=b,feature_1=feature,
                         operator_1=operator,threshold_1=threshold,feature_2="",operator_2="",threshold_2="",
-                        symbols_replicated=1,replication_category="SINGLE_SYMBOL",N_train=len(tr),WR_train=wrt,
+                        strict_symbols_replicated=1,strict_replication_category="SINGLE_SYMBOL",
+                        family_symbols_replicated=1,family_replication_category="SINGLE_SYMBOL",N_train=len(tr),WR_train=wrt,
                         edge_train=wrt-base,N_confirm=len(co),WR_confirm=wrc,edge_confirm=wrc-base,
                         Wilson_confirm_low=lo,conservative_edge_confirm=lo-base,p_raw=binomial_p(wc,len(co),base),
                         p_bonferroni=1.,p_fdr=1.,temporal_stability=stability,max_loss_streak=ml,max_win_streak=mw,
                         loss_streak_distribution=json.dumps(dist),score=0.,classification=classification,block_stats=json.dumps(blocks)))
                 if symbol_tested>=max_rules:break
             if symbol_tested>=max_rules:break
+        # Only strong TRAIN simple rules seed the bounded pair search. CONFIRM is untouched until evaluation.
+        simple=[r for r in results if r["symbol"]==symbol and not r["feature_2"] and r["N_train"]>=min_train and r["edge_train"]>0]
+        simple_groups=defaultdict(list)
+        for rule in simple:simple_groups[(rule["contract_type"],rule["barrier"])].append(rule)
+        simple=[]
+        for group in simple_groups.values():simple.extend(sorted(group,key=lambda r:r["edge_train"]*math.sqrt(r["N_train"]),reverse=True)[:12])
+        pair_counts=Counter();pair_budget=max(1,max_pairs//max(1,len(simple_groups)));seen=set()
+        for i,left in enumerate(simple):
+          for right in simple[i+1:]:
+            contract_key=(left["contract_type"],left["barrier"])
+            if contract_key!=(right["contract_type"],right["barrier"]):continue
+            if pair_counts[contract_key]>=pair_budget:continue
+            if feature_family(left["feature_1"])==feature_family(right["feature_1"]):continue
+            ordered_conditions=sorted([(left["feature_1"],left["operator_1"],left["threshold_1"]),(right["feature_1"],right["operator_1"],right["threshold_1"])])
+            first,second=ordered_conditions
+            key=(left["contract_type"],left["barrier"],*first,*second)
+            if key in seen:continue
+            seen.add(key);pair_counts[contract_key]+=1;tested+=1
+            conditions=ordered_conditions
+            tr=[r for r in train if rule_applies(r,conditions)];co=[r for r in confirm if rule_applies(r,conditions)]
+            kind=left["contract_type"];b=left["barrier"];base=baseline(kind,b)
+            wt=sum(contract_win(kind,b,r["settlement_digit"]) for r in tr);wc=sum(contract_win(kind,b,r["settlement_digit"]) for r in co)
+            wrt=wt/len(tr) if tr else 0;wrc=wc/len(co) if co else 0;lo,_=wilson(wc,len(co));blocks,stability=block_statistics(co,kind,b);ml,mw,dist=segmented_streaks(co,kind,b)
+            valid=len(tr)>=min_train and len(co)>=min_confirm and wrt>base and wrc>base
+            classification="REJECT" if not valid else ("STRONG_DISCOVERY_CANDIDATE" if lo>=base and stability>=.75 else "PROMISING")
+            cid=hashlib.sha256(f"{symbol}|{key}".encode()).hexdigest()[:16]
+            results.append(dict(candidate_id=cid,symbol=symbol,contract_type=kind,barrier=b,feature_1=first[0],operator_1=first[1],threshold_1=first[2],
+              feature_2=second[0],operator_2=second[1],threshold_2=second[2],strict_symbols_replicated=1,strict_replication_category="SINGLE_SYMBOL",
+              family_symbols_replicated=1,family_replication_category="SINGLE_SYMBOL",N_train=len(tr),WR_train=wrt,edge_train=wrt-base,N_confirm=len(co),WR_confirm=wrc,edge_confirm=wrc-base,
+              Wilson_confirm_low=lo,conservative_edge_confirm=lo-base,p_raw=binomial_p(wc,len(co),base),p_bonferroni=1.,p_fdr=1.,temporal_stability=stability,
+              max_loss_streak=ml,max_win_streak=mw,loss_streak_distribution=json.dumps(dist),score=0.,classification=classification,block_stats=json.dumps(blocks)))
     bon,fdr=adjust_pvalues([r["p_raw"] for r in results])
     for r,pb,pf in zip(results,bon,fdr):r["p_bonferroni"]=pb;r["p_fdr"]=pf
     add_replication(results)
     for r in results:
-        rep=r["symbols_replicated"]; r["score"]=r["conservative_edge_confirm"]*math.log1p(r["N_confirm"])*r["temporal_stability"]*(1+.25*(rep-1))
+        rep=max(r["strict_symbols_replicated"],r["family_symbols_replicated"]); r["score"]=r["conservative_edge_confirm"]*math.log1p(r["N_confirm"])*r["temporal_stability"]*(1+.25*(rep-1))
     return sorted(results,key=lambda r:r["score"],reverse=True),tested
 
 def feature_family(feature):
@@ -220,14 +279,23 @@ def feature_family(feature):
     if feature in {"entropy","chi_square_uniformity","max_digit_frequency","min_digit_frequency"}:return "DISTRIBUTION_CONCENTRATION"
     if feature.startswith("ticks_since_digit_"):return "DIGIT_ABSENCE"
     return feature
-def concept(row):return row["contract_type"],row["barrier"],feature_family(row["feature_1"]),row["operator_1"]
+def concept(row):
+    second=(feature_family(row["feature_2"]),row["operator_2"]) if row.get("feature_2") else ("","")
+    return row["contract_type"],row["barrier"],feature_family(row["feature_1"]),row["operator_1"],*second
+def thresholds_close(a,b):
+    scale=max(abs(float(a)),abs(float(b)),1.);return abs(float(a)-float(b))/scale<=.10
+def strict_match(a,b):
+    return (a["contract_type"],a["barrier"],a["feature_1"],a["operator_1"],a.get("feature_2",""),a.get("operator_2","")) == (b["contract_type"],b["barrier"],b["feature_1"],b["operator_1"],b.get("feature_2",""),b.get("operator_2","")) and thresholds_close(a["threshold_1"],b["threshold_1"]) and (not a.get("feature_2") or thresholds_close(a["threshold_2"],b["threshold_2"]))
 def add_replication(rows):
-    groups=defaultdict(set)
+    accepted=[r for r in rows if r["classification"]!="REJECT"]
+    family_groups=defaultdict(set)
+    for r in accepted:family_groups[concept(r)].add(r["symbol"])
     for r in rows:
-        if r["classification"]!="REJECT":groups[concept(r)].add(r["symbol"])
-    for r in rows:
-        n=len(groups.get(concept(r),{r["symbol"]}));r["symbols_replicated"]=n
-        r["replication_category"]={1:"SINGLE_SYMBOL",2:"REPLICATED_2_SYMBOLS"}.get(n,"REPLICATED_3_SYMBOLS")
+        strict_symbols={other["symbol"] for other in accepted if strict_match(r,other)} or {r["symbol"]}
+        family_symbols=family_groups.get(concept(r),{r["symbol"]})
+        sn=len(strict_symbols);fn=len(family_symbols)
+        r["strict_symbols_replicated"]=sn;r["strict_replication_category"]={1:"SINGLE_SYMBOL",2:"STRICT_REPLICATION_2_SYMBOLS"}.get(sn,"STRICT_REPLICATION_3_SYMBOLS")
+        r["family_symbols_replicated"]=fn;r["family_replication_category"]={1:"SINGLE_SYMBOL",2:"FAMILY_REPLICATION_2_SYMBOLS"}.get(fn,"FAMILY_REPLICATION_3_SYMBOLS")
 
 def deduplicate(rows):
     best={}
@@ -244,9 +312,9 @@ def write_csv(path:Path,rows:list[dict[str,Any]],fields=None):
 def frozen(shortlist,integrity):
     origins=[{k:r.get(k) for k in ("run_id","symbol","engine_version","protocol_version","git_hash")} for r in integrity if r["status"]=="USED"]
     return [{"hypothesis_id":f'discovery_{r["candidate_id"]}',"symbol":r["symbol"],"contract_type":r["contract_type"],
-      "barrier":r["barrier"],"lookback":100,"rule":{"conditions":[{"feature":r["feature_1"],"operator":r["operator_1"],"threshold":r["threshold_1"]}]},
+      "barrier":r["barrier"],"lookback":100,"rule":{"conditions":[{"feature":r["feature_1"],"operator":r["operator_1"],"threshold":r["threshold_1"]}]+([{"feature":r["feature_2"],"operator":r["operator_2"],"threshold":r["threshold_2"]}] if r.get("feature_2") else [])},
       "delay":0,"min_edge":0.02,"frozen":True,"candidate_rank":i+1,"train_stats":{"n":r["N_train"],"wr":r["WR_train"]},
-      "confirm_stats":{"n":r["N_confirm"],"wr":r["WR_confirm"]},"symbols_replicated":r["symbols_replicated"],
+      "confirm_stats":{"n":r["N_confirm"],"wr":r["WR_confirm"]},"strict_symbols_replicated":r["strict_symbols_replicated"],"family_symbols_replicated":r["family_symbols_replicated"],
       "discovery_origins":origins,"engine_compatible":False} for i,r in enumerate(shortlist)]
 
 def baseline_rows(outcomes):
@@ -261,7 +329,7 @@ def baseline_rows(outcomes):
 
 def report_text(loaded,candidates,shortlist,tested,summaries):
     used=[r for r in loaded.integrity if r["status"]=="USED"]; symbols=sorted({r["symbol"] for r in used}); valid=sum(r["horizon"]==1 for r in loaded.outcomes)
-    replicated2=sum(r["symbols_replicated"]==2 for r in shortlist);replicated3=sum(r["symbols_replicated"]>=3 for r in shortlist)
+    replicated2=sum(r["strict_symbols_replicated"]==2 for r in shortlist);replicated3=sum(r["strict_symbols_replicated"]>=3 for r in shortlist)
     lines=["SNIPER-DIGITS DISCOVERY REPORT","EXECUTIVE SUMMARY",
       f"runs_found={len(loaded.integrity)} runs_valid={len(used)} symbols={','.join(symbols)} ticks={loaded.ticks} opportunities={loaded.opportunities}",
       f"valid_primary_outcomes={valid} drops_gap={loaded.drops['DROP_GAP']} drops_reconnect={loaded.drops['DROP_RECONNECT']}",
@@ -275,11 +343,11 @@ def report_text(loaded,candidates,shortlist,tested,summaries):
       elif section=="SHORTLIST":lines += [json.dumps(r,sort_keys=True) for r in shortlist]
       elif section=="OOS RECOMMENDATIONS":lines += ["Human review is required. The current engine cannot consume generic rule.conditions; add a frozen rule evaluator before OOS."]
       elif section=="LIMITATIONS":lines += ["Discovery is exploratory, has no proposal economics, and is neither profitable nor OOS-validated. Normal-approximation p-values are screening statistics."]
-      if section=="TOP CANDIDATES":lines += ["score = conservative_edge_confirm * ln(1 + N_confirm) * temporal_stability * (1 + 0.25 * (symbols_replicated - 1))."]
+      if section=="TOP CANDIDATES":lines += ["score = conservative_edge_confirm * ln(1 + N_confirm) * temporal_stability * (1 + 0.25 * (max strict/family symbols - 1)). STRICT and FAMILY replication are reported separately."]
     return "\n".join(lines)+"\n"
 
 def run_analysis(args):
-    loaded=load_runs(Path(args.data_root),args.symbols,args.horizons); candidates,tested=evaluate_candidates(loaded.outcomes,args.train_fraction,args.min_train,args.min_confirm,args.max_rules)
+    loaded=load_runs(Path(args.data_root),args.symbols,args.horizons,getattr(args,"run_ids",None),getattr(args,"session_labels",None)); candidates,tested=evaluate_candidates(loaded.outcomes,args.train_fraction,args.min_train,args.min_confirm,args.max_rules,getattr(args,"max_pairs",200))
     candidates=deduplicate(candidates); shortlist=[r for r in candidates if r["classification"]!="REJECT"]
     stamp=datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ");out=Path(args.out_dir).parent/f"{Path(args.out_dir).name}_{stamp}";out.mkdir(parents=True)
     summaries=baseline_rows(loaded.outcomes);write_csv(out/"all_candidates.csv",candidates,CANDIDATE_FIELDS);write_csv(out/"shortlist.csv",shortlist,CANDIDATE_FIELDS)
@@ -291,8 +359,9 @@ def run_analysis(args):
 
 def parse_args(argv=None):
     p=argparse.ArgumentParser();p.add_argument("--data-root",default="data/digits_over_under");p.add_argument("--symbols",nargs="*",default=[])
+    p.add_argument("--run-ids",nargs="*",default=[]);p.add_argument("--session-labels",nargs="*",default=[])
     p.add_argument("--out-dir",default="analysis_digits_discovery");p.add_argument("--min-train",type=int,default=100);p.add_argument("--min-confirm",type=int,default=75)
-    p.add_argument("--train-fraction",type=float,default=.6);p.add_argument("--horizons",nargs="+",type=int,default=[1]);p.add_argument("--max-rules",type=int,default=5000);p.add_argument("--seed",type=int,default=1)
+    p.add_argument("--train-fraction",type=float,default=.6);p.add_argument("--horizons",nargs="+",type=int,default=[1]);p.add_argument("--max-rules",type=int,default=5000);p.add_argument("--max-pairs",type=int,default=200);p.add_argument("--seed",type=int,default=1)
     args=p.parse_args(argv); 
     if not 0<args.train_fraction<1 or any(h not in (1,2,3) for h in args.horizons):p.error("invalid split or horizon")
     return args
