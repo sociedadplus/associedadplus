@@ -42,6 +42,10 @@ OOS: `python sniper_digits_ou_research_v1.py --symbol 1HZ10V --minutes 120 --his
 
 Analysis: `python analyze_sniper_digits_ou_v1.py --results "data/digits_over_under/*/sniper_digits_v1/run_*/paper_results.csv" --opportunities "data/digits_over_under/*/sniper_digits_v1/run_*/opportunities.parquet" --hypothesis-count 8`.
 
+Discovery analysis: `python analyze_sniper_digits_discovery_v1.py --data-root data/digits_over_under --symbols 1HZ10V R_25 R_75 --out-dir analysis_digits_discovery`. This read-only stage reconstructs clean prospective outcomes from tick sequence, performs chronological TRAIN/CONFIRM screening, multiple-test correction and cross-symbol replication, and emits human-review candidates rather than starting OOS.
+
+The timestamped discovery output contains `discovery_report.txt`, `all_candidates.csv`, `shortlist.csv`, `frozen_hypotheses_candidates.json`, `run_integrity.csv`, `dropped_outcomes.csv`, `symbol_summary.csv`, and `feature_threshold_results.csv`. Candidate JSON entries are deliberately marked `engine_compatible: false`: the current OOS `Hypothesis` supports only its entropy rule, so a future, separately reviewed engine change must add a frozen generic condition evaluator before these proposals can be consumed.
+
 Windows PowerShell long run: `py sniper_digits_ou_research_v1.py --symbol 1HZ10V --minutes 480 --stake 1 --currency USD --history 5000 --out-dir data/digits_over_under --session-label win-long`.
 
 Termux long run: `termux-wake-lock && python sniper_digits_ou_research_v1.py --symbol 1HZ10V --minutes 480 --stake 1 --currency USD --history 5000 --out-dir ~/storage/shared/sniper-data --session-label termux-long; termux-wake-unlock`.
